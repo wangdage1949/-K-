@@ -27,8 +27,17 @@ HTTP_TIMEOUT = 20  # 秒
 JITTER_MIN = 10
 JITTER_MAX = 120
 
-# ✅ 防止无限翻页：每个地址总分页（所有接口合计）超过 10 就结束该地址
-MAX_PAGES_PER_ADDRESS = 10
+# ✅ 每个地址最多处理“成功页”（成功页=拿到非空 txids 的一页）
+MAX_SUCCESS_PAGES_PER_ADDRESS = 10
+
+# ✅ 某 source 连续失败达到阈值 -> 该 source 在本地址标记 done
+FAIL_THRESHOLD_PER_SOURCE = 2
+
+# ✅ 所有 source 都失败一轮 -> 短暂休息（不要太久）
+SLEEP_ALL_SOURCES_FAILED_SEC = 3
+
+# ✅ SoChain Key（没有就自动跳过）
+SOCHAIN_API_KEY = os.getenv("SOCHAIN_API_KEY", "").strip()
 
 # 统计打印
 STATS_PRINT_EVERY_SEC = 30
@@ -53,7 +62,7 @@ BLOCKCHAIN_INFO_BASE = "https://blockchain.info"
 # BlockCypher（address full: before=block_height keyset）
 BLOCKCYPHER_BASE = "https://api.blockcypher.com"
 
-# SoChain（transactions/BTC/{addr}/{page}）
+# SoChain（需要 API-KEY 头）
 SOCHAIN_BASE = "https://chain.so"
 
 # =========================
@@ -64,8 +73,8 @@ def print_logo():
     logo = r"""
 ###############################
 #                             #
-#     Reused R Scanner        #
-#   (Multi-TxID Providers)    #
+#     比特币重复 R  检测工具      #
+#   (支持断点续查+6接口轮询更换)   #
 #   TxID-list First + Resume  #
 #                             #
 ###############################
@@ -252,8 +261,8 @@ def extract_r_from_vin_esplora(vin: Dict[str, Any]) -> List[Tuple[str, str]]:
 # checkpoint（自动识别输入变化 + 版本）
 # =========================
 
-CKPT_VERSION = 2
-CKPT_MODE = "txid_agg_v1"
+CKPT_VERSION = 3
+CKPT_MODE = "txid_failover_v1"
 
 def load_checkpoint() -> Dict[str, Any]:
     if not os.path.exists(CHECKPOINT_FILE):
@@ -366,7 +375,7 @@ class RotatingHttpClient:
         self.base_i = 0
         self.sess = requests.Session()
         self.sess.headers.update({
-            "User-Agent": f"reused-r-scanner/2.0 ({self.name}; txid-list-first; jitter)"
+            "User-Agent": f"reused-r-scanner/3.0 ({self.name}; txid-failover; jitter)"
         })
 
     @property
@@ -383,13 +392,22 @@ class RotatingHttpClient:
         print(f"[BACKOFF] {reason} -> sleep {t}s (jitter {JITTER_MIN}-{JITTER_MAX})")
         time.sleep(t)
 
-    def get_json(self, url_or_path: str, stats: Dict[str, int]) -> Any:
+    def get_json(
+        self,
+        url_or_path: str,
+        stats: Dict[str, int],
+        fast_fail: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
         """
         支持：
           - 传入完整 URL: https://...
           - 传入 path: /address/... (会拼接 base)
+        fast_fail=True：
+          - 遇到 429/5xx/timeout/非200 -> 立刻返回 None（上层切换 API）
         """
-        if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
+        is_full = url_or_path.startswith("http://") or url_or_path.startswith("https://")
+        if is_full:
             url = url_or_path
         else:
             path = url_or_path
@@ -402,40 +420,69 @@ class RotatingHttpClient:
             t0 = time.time()
             try:
                 print(f"[HTTP] GET {url}")
-                resp = self.sess.get(url, timeout=HTTP_TIMEOUT)
+                if extra_headers:
+                    merged = dict(self.sess.headers)
+                    merged.update(extra_headers)
+                    resp = self.sess.get(url, timeout=HTTP_TIMEOUT, headers=merged)
+                else:
+                    resp = self.sess.get(url, timeout=HTTP_TIMEOUT)
                 dt = time.time() - t0
                 print(f"[HTTP] <- {resp.status_code} in {dt:.2f}s  via={self.name}")
 
+                # 429 限流
                 if resp.status_code == 429:
+                    if fast_fail:
+                        print("[FAST_FAIL] 429 -> return None (switch API)")
+                        return None
                     self._sleep_jitter("HTTP 429 Too Many Requests", stats)
                     self.rotate()
-                    if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
+                    if not is_full:
                         url = self.base + (url_or_path if url_or_path.startswith("/") else "/" + url_or_path)
                     continue
 
+                # 5xx
                 if 500 <= resp.status_code <= 599:
+                    if fast_fail:
+                        print(f"[FAST_FAIL] {resp.status_code} -> return None (switch API)")
+                        return None
                     self._sleep_jitter(f"HTTP {resp.status_code} ServerError", stats)
                     self.rotate()
-                    if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
+                    if not is_full:
                         url = self.base + (url_or_path if url_or_path.startswith("/") else "/" + url_or_path)
                     continue
 
+                # 401/403：认证/权限，永久性失败，别睡
+                if resp.status_code in (401, 403):
+                    print(f"[AUTH] HTTP {resp.status_code} -> return None (skip/disable)")
+                    return None
+
                 if resp.status_code != 200:
-                    # 非 200：认为该接口当前不可用，抖动后返回 None 让上层切换接口
+                    if fast_fail:
+                        print(f"[FAST_FAIL] HTTP {resp.status_code} -> return None (switch API)")
+                        return None
                     self._sleep_jitter(f"HTTP {resp.status_code} {resp.text[:120]!r}", stats)
                     return None
 
-                return resp.json()
+                try:
+                    return resp.json()
+                except Exception:
+                    return None
 
             except requests.exceptions.Timeout:
+                if fast_fail:
+                    print("[FAST_FAIL] Timeout -> return None (switch API)")
+                    return None
                 self._sleep_jitter("Timeout", stats)
                 self.rotate()
-                if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
+                if not is_full:
                     url = self.base + (url_or_path if url_or_path.startswith("/") else "/" + url_or_path)
             except requests.exceptions.RequestException as e:
+                if fast_fail:
+                    print(f"[FAST_FAIL] RequestException: {e} -> return None (switch API)")
+                    return None
                 self._sleep_jitter(f"RequestException: {e}", stats)
                 self.rotate()
-                if not (url_or_path.startswith("http://") or url_or_path.startswith("https://")):
+                if not is_full:
                     url = self.base + (url_or_path if url_or_path.startswith("/") else "/" + url_or_path)
 
 # =========================
@@ -444,7 +491,12 @@ class RotatingHttpClient:
 
 class TxidSourceBase:
     name: str = "base"
-    def fetch_page(self, address: str, state: Dict[str, Any], stats: Dict[str, int]) -> Tuple[List[str], Dict[str, Any], bool, Optional[str]]:
+    def fetch_page(
+        self,
+        address: str,
+        state: Dict[str, Any],
+        stats: Dict[str, int]
+    ) -> Tuple[List[str], Dict[str, Any], bool, Optional[str]]:
         """
         返回：(txids, new_state, done, page_fingerprint)
         - done=True：该 source 认为已拉完
@@ -469,11 +521,11 @@ class EsploraTxidSource(TxidSourceBase):
         cursor = state.get("cursor_txid", None)
 
         if phase == "first":
-            data = self.client_main.get_json(f"/address/{address}/txs", stats)
+            data = self.client_main.get_json(f"/address/{address}/txs", stats, fast_fail=True)
         else:
             if not cursor:
                 return [], state, True, None
-            data = self.client_chain.get_json(f"/address/{address}/txs/chain/{cursor}", stats)
+            data = self.client_chain.get_json(f"/address/{address}/txs/chain/{cursor}", stats, fast_fail=True)
 
         if not isinstance(data, list):
             return [], state, False, None
@@ -506,7 +558,7 @@ class BlockchainInfoTxidSource(TxidSourceBase):
     """
     分页规则：offset/limit
       https://blockchain.info/rawaddr/{addr}?format=json&limit=50&offset=...
-    注意：该接口对 bc1 兼容性可能差；失败会返回 None，上层会切换接口
+    注意：该接口对 bc1 兼容性可能差；失败会返回空/None
     """
     name = "blockchain_info"
 
@@ -518,7 +570,7 @@ class BlockchainInfoTxidSource(TxidSourceBase):
         offset = int(state.get("offset", 0))
         url = f"{BLOCKCHAIN_INFO_BASE}/rawaddr/{address}?format=json&limit={self.limit}&offset={offset}"
 
-        data = self.client.get_json(url, stats)
+        data = self.client.get_json(url, stats, fast_fail=True)
         if not isinstance(data, dict):
             return [], state, True, None
 
@@ -563,7 +615,7 @@ class BlockCypherTxidSource(TxidSourceBase):
         else:
             url = f"{BLOCKCYPHER_BASE}/v1/btc/main/addrs/{address}/full?limit={self.limit}&before={int(before)}"
 
-        data = self.client.get_json(url, stats)
+        data = self.client.get_json(url, stats, fast_fail=True)
         if not isinstance(data, dict):
             return [], state, True, None
 
@@ -583,18 +635,15 @@ class BlockCypherTxidSource(TxidSourceBase):
         if len(txids) == 0:
             return [], state, True, None
 
-        # 指纹
         min_h = min(heights) if heights else None
         fp = f"{self.name}:before={before}:minh={min_h}:first={txids[0]}:last={txids[-1]}:{len(txids)}"
 
         new_state = dict(state)
         done = False
 
-        # 用最小高度继续往更早翻页；如果拿不到高度，就没法安全翻页 -> 结束
         if min_h is None:
             done = True
         else:
-            # “below before height” -> 直接 before=min_h 即可（重复块用 txid 去重兜底）
             new_state["before_height"] = int(min_h)
             if not has_more:
                 done = True
@@ -604,7 +653,8 @@ class BlockCypherTxidSource(TxidSourceBase):
 class SoChainTxidSource(TxidSourceBase):
     """
     分页规则：page=1,2,3...
-      /api/v3/transactions/BTC/{address}/{page}  (最多 10 条/页)
+      /api/v3/transactions/BTC/{address}/{page}
+    需要 API-KEY 头；没有 key 则不应使用（本脚本会直接不加入 sources）
     """
     name = "sochain"
 
@@ -614,7 +664,13 @@ class SoChainTxidSource(TxidSourceBase):
     def fetch_page(self, address: str, state: Dict[str, Any], stats: Dict[str, int]):
         page = int(state.get("page", 1))
         url = f"{SOCHAIN_BASE}/api/v3/transactions/BTC/{address}/{page}"
-        data = self.client.get_json(url, stats)
+
+        data = self.client.get_json(
+            url,
+            stats,
+            fast_fail=True,
+            extra_headers={"API-KEY": SOCHAIN_API_KEY} if SOCHAIN_API_KEY else None
+        )
         if not isinstance(data, dict):
             return [], state, True, None
 
@@ -637,7 +693,7 @@ class SoChainTxidSource(TxidSourceBase):
         new_state["page"] = page + 1
 
         done = False
-        # 该接口没直接 hasMore；当返回 <10 一般可视为结束
+        # SoChain 每页不定；当返回很少时大概率到头
         if len(txids) < 10:
             done = True
 
@@ -648,7 +704,8 @@ class SoChainTxidSource(TxidSourceBase):
 # =========================
 
 def fetch_tx_esplora(tx_client: RotatingHttpClient, txid: str, stats: Dict[str, int]) -> Optional[Dict[str, Any]]:
-    data = tx_client.get_json(f"/tx/{txid}", stats)
+    # tx 详情可以稍微稳一点：fast_fail=False（遇到 429/5xx 会 backoff 并在 esplora_main 内 rotate）
+    data = tx_client.get_json(f"/tx/{txid}", stats, fast_fail=False)
     if not isinstance(data, dict):
         return None
     return data
@@ -681,15 +738,18 @@ def main():
         }
 
     addr_index = int(ckpt.get("addr_index", 0))
-    pages_used = int(ckpt.get("pages_used_in_addr", 0))
-    rr_index = int(ckpt.get("round_robin_index", 0))
+    success_pages = int(ckpt.get("success_pages_in_addr", 0))
     last_processed_txid = ckpt.get("last_processed_txid", None)
+
+    # 当前优先 source（failover：优先用它，失败才换）
+    current_src = ckpt.get("current_source", "esplora")
 
     # 每个 source 的分页状态
     source_states: Dict[str, Any] = ckpt.get("source_states", {}) or {}
     source_done: Dict[str, bool] = ckpt.get("source_done", {}) or {}
     source_fp: Dict[str, Any] = ckpt.get("source_last_fp", {}) or {}
     source_same_fp_hits: Dict[str, int] = ckpt.get("source_same_fp_hits", {}) or {}
+    source_fail: Dict[str, int] = ckpt.get("source_fail", {}) or {}
 
     conn = init_db(SEEN_R_DB)
 
@@ -700,34 +760,37 @@ def main():
     blockcypher = RotatingHttpClient([BLOCKCYPHER_BASE], name="blockcypher")
     sochain = RotatingHttpClient([SOCHAIN_BASE], name="sochain")
 
-    # sources
+    # sources（按优先级排列：你想先用哪个，就放前面）
     sources: List[TxidSourceBase] = [
         EsploraTxidSource(esplora_main, esplora_chain),
-        BlockchainInfoTxidSource(blockchain_info),
         BlockCypherTxidSource(blockcypher),
-        SoChainTxidSource(sochain),
+        BlockchainInfoTxidSource(blockchain_info),
     ]
+    if SOCHAIN_API_KEY:
+        sources.append(SoChainTxidSource(sochain))
+    else:
+        print("[SOCHAIN] no API key -> SoChain source disabled (not added).")
 
-    # 用 esplora 拉 tx 详情（兼容 scriptsig/witness 解析）
+    # 用 esplora 拉 tx 详情
     tx_detail_client = esplora_main
 
     stats = {
         "requests": 0,
         "backoffs": 0,
-        "pages": 0,      # txid pages
+        "pages_success": 0,   # 成功页数
         "tx": 0,
         "vin": 0,
         "sig_r": 0,
         "new_occ": 0,
         "alerts": 0,
         "tx_fetch_fail": 0,
-        "tx_sources_used": 0,
+        "source_switch": 0,
     }
 
     start_ts = time.time()
     last_stats_ts = start_ts
 
-    # addr 级别 txid 去重
+    # addr 级别 txid 去重（断点恢复）
     seen_txids_in_addr: set = set(ckpt.get("seen_txids_in_addr", []) or [])
 
     def save_ckpt():
@@ -736,34 +799,33 @@ def main():
             "mode": CKPT_MODE,
             "addresses_hash": a_hash,
             "addr_index": addr_index,
-            "pages_used_in_addr": pages_used,
-            "round_robin_index": rr_index,
+            "success_pages_in_addr": success_pages,
             "last_processed_txid": last_processed_txid,
+            "current_source": current_src,
             "source_states": source_states,
             "source_done": source_done,
             "source_last_fp": source_fp,
             "source_same_fp_hits": source_same_fp_hits,
-            # ✅ 为了断点后不重复处理同一地址里 txid
+            "source_fail": source_fail,
             "seen_txids_in_addr": list(seen_txids_in_addr)[:20000],  # 防爆：最多存 2w 个
         })
         save_checkpoint(ckpt)
 
     save_ckpt()
 
-    print(f"[RESUME] addr_index={addr_index} pages_used_in_addr={pages_used} last_processed_txid={last_processed_txid}")
+    print(f"[RESUME] addr_index={addr_index} success_pages_in_addr={success_pages} last_processed_txid={last_processed_txid} current_source={current_src}")
     print(f"[PROVIDER] esplora_main={esplora_main.base} esplora_chain={esplora_chain.base}")
 
     while addr_index < len(addrs):
         address = addrs[addr_index]
         print("\n" + "=" * 110)
         print(f"[ADDR] ({addr_index+1}/{len(addrs)}) {address}")
-        print(f"[STATE] pages_used_in_addr={pages_used}/{MAX_PAGES_PER_ADDRESS} last_processed_txid={last_processed_txid}")
+        print(f"[STATE] success_pages_in_addr={success_pages}/{MAX_SUCCESS_PAGES_PER_ADDRESS} last_processed_txid={last_processed_txid} current_source={current_src}")
         print("=" * 110)
 
         # 初始化 source 状态（如果没有）
         for s in sources:
             if s.name not in source_states:
-                # 各 source 初始 state
                 if s.name == "esplora":
                     source_states[s.name] = {"phase": "first", "cursor_txid": None}
                 elif s.name == "blockchain_info":
@@ -778,174 +840,214 @@ def main():
                 source_done[s.name] = False
             if s.name not in source_same_fp_hits:
                 source_same_fp_hits[s.name] = 0
+            if s.name not in source_fail:
+                source_fail[s.name] = 0
 
-        # 拉 txid pages（轮询 sources），总页数超过 10 就结束该地址
-        while pages_used < MAX_PAGES_PER_ADDRESS:
-            # 选择一个还没 done 的 source
+        # ---- failover 拉 txid pages（只算成功页） ----
+        while success_pages < MAX_SUCCESS_PAGES_PER_ADDRESS:
             active_sources = [s for s in sources if not source_done.get(s.name, False)]
             if not active_sources:
                 print("[ADDR] all txid sources exhausted -> done.")
                 break
 
-            s = active_sources[rr_index % len(active_sources)]
-            rr_index += 1
+            active_names = [s.name for s in active_sources]
+            if current_src not in active_names:
+                current_src = active_sources[0].name
 
-            pages_used += 1
-            stats["pages"] += 1
-            stats["tx_sources_used"] += 1
+            name_to_idx = {s.name: i for i, s in enumerate(active_sources)}
+            idx = name_to_idx.get(current_src, 0)
 
-            print(f"[TXID_PAGE] #{pages_used}/{MAX_PAGES_PER_ADDRESS} source={s.name}")
+            tried = 0
+            got_success_page = False
 
-            txids, new_state, done, fp = s.fetch_page(address, source_states.get(s.name, {}), stats)
-            source_states[s.name] = new_state
+            while tried < len(active_sources):
+                s = active_sources[idx]
+                print(f"[TXID_TRY] source={s.name} (try {tried+1}/{len(active_sources)})")
 
-            # 重复页检测（每个 source 独立）
-            if fp and fp == source_fp.get(s.name):
-                source_same_fp_hits[s.name] = int(source_same_fp_hits.get(s.name, 0)) + 1
-                print(f"[WARN] source={s.name} same page repeated x{source_same_fp_hits[s.name]} fp={fp}")
-                if source_same_fp_hits[s.name] >= 2:
-                    print(f"[ABORT] source={s.name} pagination not progressing -> mark done")
-                    done = True
-            else:
-                source_same_fp_hits[s.name] = 0
-                if fp:
-                    source_fp[s.name] = fp
+                txids, new_state, done, fp = s.fetch_page(
+                    address,
+                    source_states.get(s.name, {}),
+                    stats
+                )
+                source_states[s.name] = new_state
 
-            if done:
-                source_done[s.name] = True
+                # 重复页检测（每个 source 独立）
+                if fp and fp == source_fp.get(s.name):
+                    source_same_fp_hits[s.name] = int(source_same_fp_hits.get(s.name, 0)) + 1
+                    print(f"[WARN] source={s.name} same page repeated x{source_same_fp_hits[s.name]} fp={fp}")
+                    if source_same_fp_hits[s.name] >= 2:
+                        print(f"[ABORT] source={s.name} pagination not progressing -> mark done")
+                        done = True
+                        txids = []  # 视为失败
+                else:
+                    source_same_fp_hits[s.name] = 0
+                    if fp:
+                        source_fp[s.name] = fp
 
-            save_ckpt()
+                if done:
+                    source_done[s.name] = True
 
-            if not txids:
-                print(f"[TXID_PAGE] source={s.name} -> empty")
-                continue
-
-            # 过滤本地址内重复 txid
-            new_txids = []
-            for t in txids:
-                if t not in seen_txids_in_addr:
-                    seen_txids_in_addr.add(t)
-                    new_txids.append(t)
-
-            print(f"[TXID_PAGE] got={len(txids)} new={len(new_txids)} (addr_seen={len(seen_txids_in_addr)})")
-
-            if not new_txids:
-                continue
-
-            # 断点续跑：如果 last_processed_txid 存在，则跳过直到碰到它，然后从下一条开始
-            skipping = last_processed_txid is not None
-            if skipping:
-                print(f"[RESUME] will skip txids until passing last_processed_txid={last_processed_txid}")
-
-            for txid in new_txids:
-                if skipping:
-                    if txid == last_processed_txid:
-                        print(f"[RESUME] hit last_processed_txid={txid}, skip it and resume from next txid")
-                        skipping = False
-                    else:
-                        print(f"[RESUME] skip txid={txid}")
-                    continue
-
-                # 拉 tx 详情（Esplora）
-                tx = fetch_tx_esplora(tx_detail_client, txid, stats)
-                if not tx:
-                    stats["tx_fetch_fail"] += 1
-                    print(f"[TX] {txid} | [FAIL] cannot fetch tx detail (esplora).")
-                    # 失败也写断点，避免无限卡同一条
-                    last_processed_txid = txid
+                # ✅ 成功页：拿到非空 txids
+                if txids:
+                    success_pages += 1
+                    stats["pages_success"] += 1
+                    current_src = s.name
+                    source_fail[s.name] = 0
                     save_ckpt()
-                    continue
 
-                stats["tx"] += 1
-                vin_list = tx.get("vin", []) or []
-                confirmed = (tx.get("status", {}) or {}).get("confirmed", None)
+                    print(f"[TXID_PAGE] #{success_pages}/{MAX_SUCCESS_PAGES_PER_ADDRESS} source={s.name} got={len(txids)}")
 
-                print("-" * 110)
-                print(f"[TX] {txid} | confirmed={confirmed} | vin={len(vin_list)}")
+                    # 地址内 txid 去重
+                    new_txids = []
+                    for t in txids:
+                        if t not in seen_txids_in_addr:
+                            seen_txids_in_addr.add(t)
+                            new_txids.append(t)
+                    print(f"[TXID_PAGE] new={len(new_txids)} (addr_seen={len(seen_txids_in_addr)})")
 
-                for vin_i, vin in enumerate(vin_list):
-                    stats["vin"] += 1
-                    prev = f"{vin.get('txid')}:{vin.get('vout')}"
-                    scriptsig_len = len(vin.get("scriptsig", "") or "")
-                    witness_items = len(vin.get("witness", []) or [])
-                    print(f"  [VIN#{vin_i}] prev={prev} scriptsig_len={scriptsig_len} witness_items={witness_items}")
+                    if not new_txids:
+                        got_success_page = True
+                        break
 
-                    r_list = extract_r_from_vin_esplora(vin)
-                    if not r_list:
-                        print("    [SIG] no parsable DER signature found in scriptsig/witness")
-                        continue
+                    # 断点续跑：如果 last_processed_txid 存在，则跳过直到碰到它，然后从下一条开始
+                    skipping = last_processed_txid is not None
+                    if skipping:
+                        print(f"[RESUME] will skip txids until passing last_processed_txid={last_processed_txid}")
 
-                    for (r_hex, src) in r_list:
-                        stats["sig_r"] += 1
-                        occ = {
-                            "address": address,
-                            "txid": txid,
-                            "vin_index": vin_i,
-                            "source": src,
-                        }
-                        print(f"    [SIG] r={r_hex} source={src}")
-
-                        is_new = occ_insert_if_new(conn, r_hex, txid, vin_i, occ)
-                        if not is_new:
-                            print("    [DUP] same (r,txid,vin) observed before -> ignored")
+                    for txid in new_txids:
+                        if skipping:
+                            if txid == last_processed_txid:
+                                print(f"[RESUME] hit last_processed_txid={txid}, skip it and resume from next txid")
+                                skipping = False
+                            else:
+                                print(f"[RESUME] skip txid={txid}")
                             continue
 
-                        stats["new_occ"] += 1
-                        is_reused, first_occ, new_count = seen_r_update_on_new_occ(conn, r_hex, occ)
-                        conn.commit()
+                        tx = fetch_tx_esplora(tx_detail_client, txid, stats)
+                        if not tx:
+                            stats["tx_fetch_fail"] += 1
+                            print(f"[TX] {txid} | [FAIL] cannot fetch tx detail (esplora).")
+                            last_processed_txid = txid
+                            save_ckpt()
+                            continue
 
-                        if is_reused and first_occ:
-                            if first_occ.get("txid") == occ.get("txid") and first_occ.get("vin_index") == occ.get("vin_index"):
-                                print("    [DUP] same txid+vin (should be impossible after dedupe) -> ignored")
+                        stats["tx"] += 1
+                        vin_list = tx.get("vin", []) or []
+                        confirmed = (tx.get("status", {}) or {}).get("confirmed", None)
+
+                        print("-" * 110)
+                        print(f"[TX] {txid} | confirmed={confirmed} | vin={len(vin_list)}")
+
+                        for vin_i, vin in enumerate(vin_list):
+                            stats["vin"] += 1
+                            prev = f"{vin.get('txid')}:{vin.get('vout')}"
+                            scriptsig_len = len(vin.get("scriptsig", "") or "")
+                            witness_items = len(vin.get("witness", []) or [])
+                            print(f"  [VIN#{vin_i}] prev={prev} scriptsig_len={scriptsig_len} witness_items={witness_items}")
+
+                            r_list = extract_r_from_vin_esplora(vin)
+                            if not r_list:
+                                print("    [SIG] no parsable DER signature found in scriptsig/witness")
+                                continue
+
+                            for (r_hex, src) in r_list:
+                                stats["sig_r"] += 1
+                                occ = {
+                                    "address": address,
+                                    "txid": txid,
+                                    "vin_index": vin_i,
+                                    "source": src,
+                                }
+                                print(f"    [SIG] r={r_hex} source={src}")
+
+                                is_new = occ_insert_if_new(conn, r_hex, txid, vin_i, occ)
+                                if not is_new:
+                                    print("    [DUP] same (r,txid,vin) observed before -> ignored")
+                                    continue
+
+                                stats["new_occ"] += 1
+                                is_reused, first_occ, new_count = seen_r_update_on_new_occ(conn, r_hex, occ)
+                                conn.commit()
+
+                                if is_reused and first_occ:
+                                    if first_occ.get("txid") == occ.get("txid") and first_occ.get("vin_index") == occ.get("vin_index"):
+                                        print("    [DUP] same txid+vin (should be impossible after dedupe) -> ignored")
+                                    else:
+                                        stats["alerts"] += 1
+                                        print(f"    [ALERT] REUSED r FOUND! r={r_hex} count={new_count}")
+                                        print(f"            first={first_occ}")
+                                        print(f"            now  ={occ}")
+                                        append_find(r_hex, first_occ, occ, new_count)
+
+                        last_processed_txid = txid
+                        save_ckpt()
+
+                        # 周期统计
+                        now = time.time()
+                        if now - last_stats_ts >= STATS_PRINT_EVERY_SEC:
+                            done_addr = addr_index
+                            elapsed = now - start_ts
+                            addr_per_sec = (done_addr / elapsed) if elapsed > 0 else 0.0
+                            remain = len(addrs) - done_addr
+                            eta_sec = (remain / addr_per_sec) if addr_per_sec > 0 else None
+                            print("\n" + "#" * 90)
+                            print(f"[STATS] done_addr {done_addr:,}/{len(addrs):,} ({done_addr/len(addrs)*100:.3f}%)")
+                            print(f"[STATS] success_pages_in_addr={success_pages}/{MAX_SUCCESS_PAGES_PER_ADDRESS} tx={stats['tx']} vin={stats['vin']}")
+                            print(f"[STATS] requests={stats['requests']} backoffs={stats['backoffs']} sig_r={stats['sig_r']} new_occ={stats['new_occ']} alerts={stats['alerts']}")
+                            print(f"[STATS] tx_fetch_fail={stats['tx_fetch_fail']} source_switch={stats['source_switch']}")
+                            if eta_sec is not None:
+                                finish_ts = now + eta_sec
+                                print(f"[STATS] ETA {eta_sec/3600:.2f} hours | finish ~ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finish_ts))}")
                             else:
-                                stats["alerts"] += 1
-                                print(f"    [ALERT] REUSED r FOUND! r={r_hex} count={new_count}")
-                                print(f"            first={first_occ}")
-                                print(f"            now  ={occ}")
-                                append_find(r_hex, first_occ, occ, new_count)
+                                print("[STATS] ETA unknown (speed too low)")
+                            print("#" * 90 + "\n")
+                            last_stats_ts = now
 
-                # 每 tx 保存断点
-                last_processed_txid = txid
+                    # ✅ 本页 txids 处理完：清掉“页内续跑点”
+                    last_processed_txid = None
+                    save_ckpt()
+
+                    got_success_page = True
+                    break
+
+                # ❌ 失败：不消耗 success_pages，切换下一个 source
+                source_fail[s.name] = int(source_fail.get(s.name, 0)) + 1
+                print(f"[TXID_FAIL] source={s.name} empty/err -> fail_count={source_fail[s.name]}")
+
+                if source_fail[s.name] >= FAIL_THRESHOLD_PER_SOURCE:
+                    print(f"[TXID_FAIL] source={s.name} >= {FAIL_THRESHOLD_PER_SOURCE} failures -> mark done")
+                    source_done[s.name] = True
+
+                # 切换到下一个 source
+                next_idx = (idx + 1) % len(active_sources)
+                next_src = active_sources[next_idx].name
+                if next_src != current_src:
+                    stats["source_switch"] += 1
+                    print(f"[SWITCH] {current_src} -> {next_src}")
+                current_src = next_src
+
                 save_ckpt()
+                idx = next_idx
+                tried += 1
 
-                # 周期打印统计
-                now = time.time()
-                if now - last_stats_ts >= STATS_PRINT_EVERY_SEC:
-                    done_addr = addr_index
-                    elapsed = now - start_ts
-                    addr_per_sec = (done_addr / elapsed) if elapsed > 0 else 0.0
-                    remain = len(addrs) - done_addr
-                    eta_sec = (remain / addr_per_sec) if addr_per_sec > 0 else None
-                    print("\n" + "#" * 90)
-                    print(f"[STATS] done_addr {done_addr:,}/{len(addrs):,} ({done_addr/len(addrs)*100:.3f}%)")
-                    print(f"[STATS] pages_used_in_addr={pages_used}/{MAX_PAGES_PER_ADDRESS} pages={stats['pages']} tx={stats['tx']} vin={stats['vin']}")
-                    print(f"[STATS] requests={stats['requests']} backoffs={stats['backoffs']} sig_r={stats['sig_r']} new_occ={stats['new_occ']} alerts={stats['alerts']}")
-                    print(f"[STATS] tx_fetch_fail={stats['tx_fetch_fail']}")
-                    if eta_sec is not None:
-                        finish_ts = now + eta_sec
-                        print(f"[STATS] ETA {eta_sec/3600:.2f} hours | finish ~ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finish_ts))}")
-                    else:
-                        print("[STATS] ETA unknown (speed too low)")
-                    print("#" * 90 + "\n")
-                    last_stats_ts = now
+            if not got_success_page:
+                print(f"[TXID_FAIL] all active sources failed this round -> sleep {SLEEP_ALL_SOURCES_FAILED_SEC}s and retry")
+                time.sleep(SLEEP_ALL_SOURCES_FAILED_SEC)
 
-            # ✅ 本轮 new_txids 处理完，清掉“页内续跑点”
-            last_processed_txid = None
-            save_ckpt()
-
-        # 超过分页上限 / sources 枯竭：结束该地址
-        if pages_used >= MAX_PAGES_PER_ADDRESS:
-            print(f"[LIMIT] pages_used_in_addr reached {MAX_PAGES_PER_ADDRESS}. stop this address.")
+        # 地址结束
+        if success_pages >= MAX_SUCCESS_PAGES_PER_ADDRESS:
+            print(f"[LIMIT] success_pages_in_addr reached {MAX_SUCCESS_PAGES_PER_ADDRESS}. stop this address.")
 
         # 推进到下一个地址：重置 addr 内状态
         addr_index += 1
-        pages_used = 0
-        rr_index = 0
+        success_pages = 0
         last_processed_txid = None
+        current_src = "esplora"
         source_states = {}
         source_done = {}
         source_fp = {}
         source_same_fp_hits = {}
+        source_fail = {}
         seen_txids_in_addr = set()
 
         save_ckpt()
